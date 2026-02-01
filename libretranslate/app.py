@@ -872,6 +872,166 @@ def create_app(args):
             raise e
             abort(500, description=_("Cannot translate text: %(text)s", text=str(e)))
 
+    @bp.get("/translate")
+    @access_check
+    def translate_get():
+        """Translate Text (GET)
+
+        Compatibility endpoint for clients that can only issue GET requests.
+
+        Examples:
+          - /translate?q=Hello&source=en&target=es
+          - /translate?q=Hello&q=World&source=en&target=es
+        """
+        qs = request.args.getlist("q")
+        q = qs if len(qs) > 1 else (qs[0] if len(qs) == 1 else None)
+        source_lang = iso2model(request.args.get("source"))
+        target_lang = iso2model(request.args.get("target"))
+        text_format = request.args.get("format")
+        num_alternatives = request.args.get("alternatives", 0)
+
+        if not q:
+            abort(400, description=_("Invalid request: missing %(name)s parameter", name='q'))
+        if not source_lang:
+            abort(400, description=_("Invalid request: missing %(name)s parameter", name='source'))
+        if not target_lang:
+            abort(400, description=_("Invalid request: missing %(name)s parameter", name='target'))
+
+        try:
+            num_alternatives = max(0, int(num_alternatives))
+        except ValueError:
+            abort(400, description=_("Invalid request: %(name)s parameter is not a number", name='alternatives'))
+
+        if args.alternatives_limit != -1 and num_alternatives > args.alternatives_limit:
+            abort(400, description=_("Invalid request: %(name)s parameter must be <= %(value)s", name='alternatives', value=args.alternatives_limit))
+
+        # Normalize line endings to UNIX style (LF) only so we can consistently
+        # enforce character limits.
+        if isinstance(q, list):
+            q = ["\n".join(t.splitlines()) for t in q]
+        else:
+            q = "\n".join(q.splitlines())
+
+        char_limit = get_char_limit(args.char_limit, api_keys_db)
+
+        batch = isinstance(q, list)
+
+        if batch and args.batch_limit != -1:
+            batch_size = len(q)
+            if args.batch_limit < batch_size:
+                abort(
+                    400,
+                    description=_("Invalid request: request (%(size)s) exceeds text limit (%(limit)s)", size=batch_size, limit=args.batch_limit),
+                )
+
+        src_texts = q if batch else [q]
+
+        ak = get_req_api_key()
+        cache_key = None
+        if trans_cache.should_check(ak):
+            cache_key, hit = trans_cache.hit(src_texts, source_lang, target_lang, text_format, num_alternatives)
+            if hit is not None:
+                return Response(hit, status=200, mimetype="application/json")
+
+        if char_limit != -1:
+            for text in src_texts:
+                if len(text) > char_limit:
+                    abort(
+                        400,
+                        description=_("Invalid request: request (%(size)s) exceeds text limit (%(limit)s)", size=len(text), limit=char_limit),
+                    )
+
+        if batch:
+            request.req_cost = max(1, len(q))
+
+        translatable = detect_translatable(src_texts)
+        if translatable:
+            if source_lang == "auto":
+                candidate_langs = detect_languages(src_texts)
+                detected_src_lang = candidate_langs[0]
+            else:
+                detected_src_lang = {"confidence": 100.0, "language": source_lang}
+        else:
+            detected_src_lang = {"confidence": 0.0, "language": "en"}
+
+        src_lang = next(iter([l for l in languages if l.code == detected_src_lang["language"]]), None)
+
+        if src_lang is None:
+            abort(400, description=_("%(lang)s is not supported", lang=source_lang))
+
+        tgt_lang = next(iter([l for l in languages if l.code == target_lang]), None)
+
+        if tgt_lang is None:
+            abort(400, description=_("%(lang)s is not supported",lang=target_lang))
+
+        if not text_format:
+            text_format = "text"
+
+        if text_format not in ["text", "html"]:
+            abort(400, description=_("%(format)s format is not supported", format=text_format))
+
+        try:
+            if batch:
+                batch_results = []
+                batch_alternatives = []
+                for text in q:
+                    translator = src_lang.get_translation(tgt_lang)
+                    if translator is None:
+                        abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_lang.name), scode=src_lang.code))
+
+                    if translatable:
+                        if text_format == "html":
+                            translated_text = unescape(str(translate_html(translator, text)))
+                            alternatives = []
+                        else:
+                            hypotheses = translator.hypotheses(text, num_alternatives + 1)
+                            translated_text = unescape(improve_translation_formatting(text, hypotheses[0].value))
+                            alternatives = filter_unique([unescape(improve_translation_formatting(text, hypotheses[i].value)) for i in range(1, len(hypotheses))], translated_text)
+                    else:
+                        translated_text = text
+                        alternatives = []
+
+                    batch_results.append(translated_text)
+                    batch_alternatives.append(alternatives)
+
+                result = {"translatedText": batch_results}
+
+                if source_lang == "auto":
+                    result["detectedLanguage"] = [model2iso(detected_src_lang)] * len(q)
+                if num_alternatives > 0:
+                    result["alternatives"] = batch_alternatives
+            else:
+                translator = src_lang.get_translation(tgt_lang)
+                if translator is None:
+                    abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_lang.name), scode=src_lang.code))
+
+                if translatable:
+                    if text_format == "html":
+                        translated_text = unescape(str(translate_html(translator, q)))
+                        alternatives = []
+                    else:
+                        hypotheses = translator.hypotheses(q, num_alternatives + 1)
+                        translated_text = unescape(improve_translation_formatting(q, hypotheses[0].value))
+                        alternatives = filter_unique([unescape(improve_translation_formatting(q, hypotheses[i].value)) for i in range(1, len(hypotheses))], translated_text)
+                else:
+                    translated_text = q
+                    alternatives = []
+
+                result = {"translatedText": translated_text}
+
+                if source_lang == "auto":
+                    result["detectedLanguage"] = model2iso(detected_src_lang)
+                if num_alternatives > 0:
+                    result["alternatives"] = alternatives
+
+            if cache_key is not None:
+                trans_cache.cache(cache_key, result)
+
+            return jsonify(result)
+        except Exception as e:
+            raise e
+            abort(500, description=_("Cannot translate text: %(text)s", text=str(e)))
+
     @bp.post("/translate_file")
     @access_check
     def translate_file():

@@ -15,6 +15,20 @@ def test_api_translate(client):
     assert response.status_code == 200
 
 
+def test_api_translate_get(client):
+    response = client.get("/translate", query_string={
+        "q": "Hello",
+        "source": "en",
+        "target": "es",
+        "format": "text",
+    })
+
+    response_json = json.loads(response.data)
+
+    assert "translatedText" in response_json
+    assert response.status_code == 200
+
+
 def test_api_translate_batch(client):
 
     response = client.post("/translate", json={
